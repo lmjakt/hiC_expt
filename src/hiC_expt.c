@@ -2,6 +2,7 @@
 #include <R.h>
 #include <pthread.h>
 #include "kvec.h"
+#include "ksort.h"
 
 #define MAX_THREADS 96
 
@@ -9,14 +10,21 @@
 
 // minimal information about an alignment pair;
 typedef struct {
+  int i;
   int tg;
   int pos;
   int m_tg;
   int m_pos;
 } align_pair;
 
-align_pair init_al_pair(int tg, int pos, int m_tg, int m_pos){
+#define align_pair_lt(a, b) ( (a).pos < (b).pos )
+#define align_pair_gt(a, b) ( (a).pos > (b).pos )
+KSORT_INIT(pair_sort, align_pair, align_pair_lt);
+KSORT_INIT(pair_sort_rev, align_pair, align_pair_gt);
+
+align_pair init_al_pair(int i, int tg, int pos, int m_tg, int m_pos){
   align_pair ap;
+  ap.i = i;
   ap.tg = tg;
   ap.pos = pos;
   ap.m_tg = m_tg;
@@ -337,9 +345,9 @@ SEXP assess_region_links_mt(SEXP pos_r, SEXP breaks_n_r){
 #define IN_RANGE(pos, reg_beg, reg_end) ( ((pos) >= (reg_beg)) && ((pos) < (reg_end)) )
 // IS_LEFT returns true if reg_id and m_reg (mate region) are different OR if pos < m_pos
 // 
-#define IS_LEFT(reg_id, m_reg, pos, m_pos, rot) ( ((reg_id) != (m_reg)) || (((pos) < (m_pos))^(rot)) )
+#define IS_LEFT(reg_id, m_reg, pos, m_pos) ( ((reg_id) != (m_reg)) || ((pos) < (m_pos)) )
 // Like IS_LEFT, but pos > m_pos
-#define IS_RIGHT(reg_id, m_reg, pos, m_pos, rot) ( ((reg_id) != (m_reg)) || (((pos) > (m_pos))^(rot)) )
+#define IS_RIGHT(reg_id, m_reg, pos, m_pos) ( ((reg_id) != (m_reg)) || ((pos) > (m_pos)) )
 
 
 
@@ -383,10 +391,7 @@ SEXP assess_separation(SEXP A_r, SEXP B_r, SEXP reg_limits_r, SEXP seps_r){
     error("Unreasonable limits information given. Try again");
   if(strategy != 0)
     error("Only strategy 0 allowed");
-  
-  if(A_rot || B_rot)
-    warning("Rotation of positions not yet implemented\nNo rotation performed");
-  
+    
   int seps_n = length(seps_r);
   if(seps_n < 1)
     error("Specify at least one separation distance");
@@ -406,7 +411,7 @@ SEXP assess_separation(SEXP A_r, SEXP B_r, SEXP reg_limits_r, SEXP seps_r){
   }
   // for convenience define pointers into the matrix:
   int *A = INTEGER(A_r);
-  int *B = INTEGER(A_r);
+  int *B = INTEGER(B_r);
   int *A_pos = A + A_dim[0]; int *A_m_tg = A + A_dim[0] * 2; int *A_m_pos = A + A_dim[0] * 3;
   int *B_pos = B + B_dim[0]; int *B_m_tg = B + B_dim[0] * 2; int *B_m_pos = B + B_dim[0] * 3;
   
@@ -421,41 +426,109 @@ SEXP assess_separation(SEXP A_r, SEXP B_r, SEXP reg_limits_r, SEXP seps_r){
   // First determine the set that we keep
   // integers so that we can pass back to R
   // keep the indices in kvectors
-  kvec_t(int) A_i;  kv_init(A_i);
-  kvec_t(int) B_i;  kv_init(B_i);
+  /* kvec_t(int) A_i;  kv_init(A_i); */
+  /* kvec_t(int) B_i;  kv_init(B_i); */
+    // copy the alignment information into vectors of align_pair structs
+  // change coordinate system such that we use 0 -> distance for each one
+  // This is in order to allow changing of the order if rot is true;
+  kvec_t(align_pair) A_pairs; kv_init(A_pairs);
+  kvec_t(align_pair) B_pairs; kv_init(B_pairs);
+
+  // if the region is rotated iterate backwards through the region
+  // but 
+  int a_i[3] = {0, A_dim[0]-1, 1};
+  int b_i[3] = {0, B_dim[0]-1, 1};
+
+  if(A_rot)
+    a_i[2] = -1;
+  if(B_rot)
+    b_i[2] = -1;
+
+  // The positions in B should be a continuum with those in A; that means
+  // that they should start from A_max+1 and run upwards
+  int B_off = 1 + A_max-A_min;
+  
   // keep left reads within the regions
-  for(int i = 0; i < A_dim[0]; ++i){
-    switch(strategy){
+  // This should clearly be refactored to a function of some sort.
+  for(int i=a_i[A_rot]; i >= a_i[0] && i <= a_i[1]; i += a_i[2]){
+    int in_range_A = IN_RANGE(A_pos[i], A_min, A_max);
+    int m_in_range_A = IN_REGION(A_m_tg[i], A_m_pos[i], A_tg, A_min, A_max);
+    int m_in_range_B = IN_REGION(A_m_tg[i], A_m_pos[i], B_tg, B_min, B_max);
+    int is_left = IS_LEFT(A_tg, A_m_tg[i], A_pos[i], A_m_pos[i]);
+    if(!in_range_A || !(m_in_range_A || m_in_range_B))
+      continue;
+
+    switch(A_rot){
     case 0:
-      if(IN_RANGE(A_pos[i], A_min, A_max) && IS_LEFT(A_tg, A_m_tg[i], A_pos[i], A_m_pos[i], A_rot) &&
-	 (IN_REGION(A_m_tg[i], A_m_pos[i], A_tg, A_min, A_max) ||
-	  IN_REGION(A_m_tg[i], A_m_pos[i], B_tg, B_min, B_max)))
-	kv_push(int, A_i, i);
+      if(is_left)
+	kv_push(align_pair, A_pairs,
+		m_in_range_A ? 
+		init_al_pair(i, A_tg, A_pos[i]-A_min, A_m_tg[i], A_m_pos[i]-A_min) :
+		B_rot ?
+		init_al_pair(i, A_tg, A_pos[i]-A_min, A_m_tg[i], B_off + B_max-A_m_pos[i]) :
+		init_al_pair(i, A_tg, A_pos[i]-A_min, A_m_tg[i], B_off + A_m_pos[i]-B_min));
       break;
     case 1:
-      if(IN_RANGE(A_pos[i], A_min, A_max))
-	kv_push(int, A_i, i);
+      if(!is_left)
+	break;
+      // this is more difficult as the mate may be in the other region
+      // we should swap the positions over as well.
+      if(m_in_range_A){     // easy
+	kv_push(align_pair, A_pairs, init_al_pair(i, A_m_tg[i], A_max - A_m_pos[i], A_tg, A_max - A_pos[i]));
+	//	kv_push(align_pair, A_pairs, init_al_pair(i, A_tg, A_max - A_pos[i], A_m_tg[i], A_max - A_m_pos[i]));
+      }else{
+	// 
+	kv_push(align_pair, A_pairs, B_rot ?
+		init_al_pair(i, A_tg, A_max - A_pos[i], A_m_tg[i], B_off + B_max - A_m_pos[i]) :
+		init_al_pair(i, A_tg, A_max - A_pos[i], A_m_tg[i], B_off + A_m_pos[i] - B_min));
+      }
       break;
-    default:
-      Rprintf("Unknown strategy: doing nothing");
+    default :
+      warning("A_rot has a value of %d. Should be between 0 and 1", A_rot);
     }
   }
-  // keep right reads within the regions
-  for(int i = 0; i < B_dim[0]; ++i){
-    switch(strategy){
+  // REFACTOR requirement! This is BAD
+  for(int i=b_i[B_rot]; i >= b_i[0] && i <= b_i[1]; i += b_i[2]){
+    int in_range_B = IN_RANGE(B_pos[i], B_min, B_max);
+    int m_in_range_A = IN_REGION(B_m_tg[i], B_m_pos[i], A_tg, A_min, A_max);
+    int m_in_range_B = IN_REGION(B_m_tg[i], B_m_pos[i], B_tg, B_min, B_max);
+    int is_right = IS_RIGHT(B_tg, B_m_tg[i], B_pos[i], B_m_pos[i]);
+    if(!in_range_B || !(m_in_range_A || m_in_range_B))
+      continue;
+
+    switch(B_rot){
     case 0:
-      if(IN_RANGE(B_pos[i], B_min, B_max) && IS_RIGHT(B_tg, B_m_tg[i], B_pos[i], B_m_pos[i], B_rot) &&
-	 (IN_REGION(B_m_tg[i], B_m_pos[i], B_tg, B_min, B_max) ||
-	  IN_REGION(B_m_tg[i], B_m_pos[i], A_tg, A_min, A_max)))
-	kv_push(int, B_i, i);
+      if(is_right)
+	kv_push(align_pair, B_pairs,
+		m_in_range_B ?
+		init_al_pair(i, B_tg, B_off + B_pos[i]-B_min, B_m_tg[i], B_off + B_m_pos[i]-B_min) :
+		A_rot ?
+		init_al_pair(i, B_tg, B_off + B_pos[i]-B_min, B_m_tg[i], A_max-B_m_pos[i]) :
+		init_al_pair(i, B_tg, B_off + B_pos[i]-B_min, B_m_tg[i], B_m_pos[i]-A_min));
       break;
     case 1:
-      if(IN_RANGE(B_pos[i], B_min, B_max))
-	kv_push(int, B_i, i);
+      if(!is_right)
+	break;
+      // this is more difficult as the mate may be in the other region
+      if(m_in_range_B){     // easy
+	kv_push(align_pair, B_pairs, init_al_pair(i, B_m_tg[i], B_off + B_max - B_m_pos[i], B_tg, B_off + B_max - B_pos[i]));
+      }else{
+	// The mate is in A, and may also need to be rotated
+	kv_push(align_pair, B_pairs, A_rot ?
+		init_al_pair(i, B_tg, B_off + B_max - B_pos[i], B_m_tg[i], A_max - B_m_pos[i]) :
+		init_al_pair(i, B_tg, B_off + B_max - B_pos[i], B_m_tg[i], B_m_pos[i] - A_min));
+      }
       break;
-    default:
-      Rprintf("Unknown strategy: doing nothing");
-    }	
+    default :
+      warning("B_rot has a value of %d. Should be between 0 and 1", B_rot);
+    }
+  }
+  // if we have rotated either A or B, then we need to sort again as we
+  // do not have any guarantees of order. I'm not completely sure right now
+  // if this is needed but try doing it first.
+  if(A_rot || B_rot){
+    ks_introsort( pair_sort, A_pairs.n, A_pairs.a );
+    ks_introsort( pair_sort, B_pairs.n, B_pairs.a );
   }
   
   // For every left read (i) in A:
@@ -483,108 +556,83 @@ SEXP assess_separation(SEXP A_r, SEXP B_r, SEXP reg_limits_r, SEXP seps_r){
   //   2. Pos (this may be modified to be region specific or reordered)
   //   3. Mate pos. If outside region, not included.
   SEXP ret_data = PROTECT(allocVector(VECSXP, 8));
-  SET_VECTOR_ELT(ret_data, 0, allocVector(REALSXP, A_i.n));
-  SET_VECTOR_ELT(ret_data, 1, allocMatrix(REALSXP, seps_n, B_i.n));
-  SET_VECTOR_ELT(ret_data, 2, allocVector(REALSXP, B_i.n));
-  SET_VECTOR_ELT(ret_data, 3, allocMatrix(REALSXP, seps_n, A_i.n));
-  SET_VECTOR_ELT(ret_data, 4, allocVector(INTSXP, A_i.n));
-  SET_VECTOR_ELT(ret_data, 5, allocVector(INTSXP, B_i.n));
-  SET_VECTOR_ELT(ret_data, 6, allocMatrix(INTSXP, A_i.n, 3));
-  SET_VECTOR_ELT(ret_data, 7, allocMatrix(INTSXP, B_i.n, 3));
+  SET_VECTOR_ELT(ret_data, 0, allocVector(REALSXP, A_pairs.n));
+  SET_VECTOR_ELT(ret_data, 1, allocMatrix(REALSXP, seps_n, B_pairs.n));
+  SET_VECTOR_ELT(ret_data, 2, allocVector(REALSXP, B_pairs.n));
+  SET_VECTOR_ELT(ret_data, 3, allocMatrix(REALSXP, seps_n, A_pairs.n));
+  SET_VECTOR_ELT(ret_data, 4, allocMatrix(INTSXP, sizeof(align_pair) / sizeof(int),  A_pairs.n));
+  SET_VECTOR_ELT(ret_data, 5, allocMatrix(INTSXP, sizeof(align_pair) / sizeof(int), B_pairs.n));
+  SET_VECTOR_ELT(ret_data, 6, allocMatrix(INTSXP, A_pairs.n, 3));
+  SET_VECTOR_ELT(ret_data, 7, allocMatrix(INTSXP, B_pairs.n, 3));
 
-  memcpy(INTEGER(VECTOR_ELT(ret_data, 4)), A_i.a, sizeof(int) * A_i.n);
-  memcpy(INTEGER(VECTOR_ELT(ret_data, 5)), B_i.a, sizeof(int) * B_i.n);
+  memcpy(INTEGER(VECTOR_ELT(ret_data, 4)), A_pairs.a, sizeof(align_pair) * A_pairs.n);
+  memcpy(INTEGER(VECTOR_ELT(ret_data, 5)), B_pairs.a, sizeof(align_pair) * B_pairs.n);
   
   double *A_int = REAL(VECTOR_ELT(ret_data, 0));
   double *A_to_B = REAL(VECTOR_ELT(ret_data, 1));
   double *B_int = REAL(VECTOR_ELT(ret_data, 2));
   double *B_to_A = REAL(VECTOR_ELT(ret_data, 3));
 
-  memset(A_int, 0, sizeof(double) * A_i.n);
-  memset(A_to_B, 0, sizeof(double) * B_i.n * seps_n);
-  memset(B_int, 0, sizeof(double) * B_i.n);
-  memset(B_to_A, 0, sizeof(double) * A_i.n * seps_n);
+  memset(A_int, 0, sizeof(double) * A_pairs.n);
+  memset(A_to_B, 0, sizeof(double) * B_pairs.n * seps_n);
+  memset(B_int, 0, sizeof(double) * B_pairs.n);
+  memset(B_to_A, 0, sizeof(double) * A_pairs.n * seps_n);
 
   // I would be better to have a struct of some sort here. 
   int *A_obs_flag = INTEGER(VECTOR_ELT(ret_data, 6));
   int *B_obs_flag = INTEGER(VECTOR_ELT(ret_data, 7));
-  int *A_obs_pos = A_obs_flag + A_i.n;
-  int *A_obs_mpos = A_obs_pos + A_i.n;
-  int *B_obs_pos = B_obs_flag + B_i.n;
-  int *B_obs_mpos = B_obs_pos + B_i.n;
+  int *A_obs_pos = A_obs_flag + A_pairs.n;
+  int *A_obs_mpos = A_obs_pos + A_pairs.n;
+  int *B_obs_pos = B_obs_flag + B_pairs.n;
+  int *B_obs_mpos = B_obs_pos + B_pairs.n;
 
-  memset(A_obs_flag, 0, sizeof(int) * A_i.n * 3);
-  memset(B_obs_flag, 0, sizeof(int) * B_i.n * 3);
+  memset(A_obs_flag, 0, sizeof(int) * A_pairs.n * 3);
+  memset(B_obs_flag, 0, sizeof(int) * B_pairs.n * 3);
 
-  // copy the alignment information into vectors of align_pair structs
-  // change coordinate system such that we use 0 -> distance for each one
-  // This is in order to allow changing of the order if rot is true;
-  align_pair *A_pairs = malloc(sizeof(align_pair) * A_i.n);
-  align_pair *B_pairs = malloc(sizeof(align_pair) * B_i.n);
-
-  // Finish this bit later. Commented out to see if the code compiles
-  // only temporary.
-  /* for(size_t i=0; i < A_i.n; ++i){ */
-  /*   size_t ii = A_rot ? A_i.a[ A_i.n - (1+i) ] : A_i.a[i]; */
-  /*   A[ii] = init_al_pair(A_tg[ii], */
-  /* 			 A_rot ? A_max - A_pos[ii] : A_pos[ii] - A_min[ii], */
-  /* 			 A_m_tg[ii], */
-  /* 			 A_rot ? A_max - A_m_pos[ii] :  */
-  
-  Rprintf("A_i.n: %ld  B_i.n: %ld\n", A_i.n, B_i.n);
-  size_t ii=0; size_t jj=0;
-  for(size_t i=0; i < A_i.n; ++i){
-    ii = A_i.a[i];
-    A_obs_pos[i] = A_pos[ii];
-    A_obs_mpos[i] = A_m_pos[ii];
-    A_obs_flag[i] = 0 | IN_REGION(A_m_tg[ii], A_m_pos[ii], A_tg, A_min, A_max) |
-      (IN_REGION(A_m_tg[ii], A_m_pos[ii], B_tg, B_min, B_max) << 1);
-    A_obs_flag[i] |= ( ((A_m_tg[ii] == A_tg) && (A_pos[ii] > A_m_pos[ii])) << 2 );
+  Rprintf("A_pairs.n: %ld  B_pairs.n: %ld\n", A_pairs.n, B_pairs.n);
+  //  size_t ii=0; size_t jj=0;
+  for(size_t i=0; i < A_pairs.n; ++i){
+    A_obs_pos[i] = A_pairs.a[i].pos; 
+    A_obs_mpos[i] = A_pairs.a[i].m_pos;
+    A_obs_flag[i] = A_pairs.a[i].m_pos < B_off | ((A_pairs.a[i].m_pos >= B_off) << 1) |
+      ((A_pairs.a[i].pos > A_pairs.a[i].m_pos) << 2);
     // internal links first:
     // For internal links, we need to consider only ones that have a distance
     // of more than min_sep; this is because we only count such links for
     // the observation; the probability of such links are thus 0.
-    // We need to consider the absolute distance if strategy 1 is used
-    for(size_t j=i; j < A_i.n; ++j){
-      jj = A_i.a[j];
-      // Considering the mate leads to big underestimates; given that
-      // we are trying to get a localised mappability value that kind
-      // of makes sense; revert to using left -> left for internal
-      // and left -> right for external
-      //      if( A_m_tg[jj] == A_tg && A_m_pos[jj] < A_max )
-      if( A_pos[jj] - A_pos[ii] >= min_sep )
-	A_int[j] += 1 / (double)(A_pos[jj] - A_pos[ii]);
-      //	A_int[j] += 1 / (double)(abs(A_m_pos[jj] - A_pos[ii]));
+    for(size_t j=i+1; j < A_pairs.n; ++j){
+      if( A_pairs.a[j].pos - A_pairs.a[i].pos >= min_sep)
+	A_int[i] += 1 / (double)(A_pairs.a[j].pos - A_pairs.a[i].pos);
     }
-    for(size_t j=0; j < B_i.n; ++j){
-      for(size_t k=0; k < seps_n; ++k)
-	A_to_B[ j * seps_n + k ] += 1 / (double)( (B_pos[B_i.a[j]] - B_min) + (A_max - A_pos[A_i.a[i]]) + seps[k] );
+    for(size_t j=0; j < B_pairs.n; ++j){
+      for(size_t k=0; k < seps_n; ++k){ // we should possibly check for consecutive reads that are too close to each other
+	if(seps[k] + B_pairs.a[j].pos - A_pairs.a[i].pos)
+	  A_to_B[ j * seps_n + k ] += 1 / (double)( (B_pairs.a[j].pos - A_pairs.a[i].pos) + seps[k] );
+      }
     }
   }
   // Then do the same for B,
-  // Do in reverse order such that the mates
+  // Not sure that reverse order is needed given the refactoring to using A_pairs
+  // and B_pairs. 
   // ssize_t necessary; or we could check with i < B_i.n-1
-  for(ssize_t i=(B_i.n-1); i >=0; --i){
-    ii = B_i.a[i];
-    B_obs_pos[i] = B_pos[ii];
-    B_obs_mpos[i] = B_m_pos[ii];
-    B_obs_flag[i] = 0 | IN_REGION(B_m_tg[ii], B_m_pos[ii], B_tg, B_min, B_max) |
-      (IN_REGION(B_m_tg[ii], B_m_pos[ii], A_tg, A_min, A_max) << 1);
-    B_obs_flag[i] |= ( ((B_m_tg[ii] == B_tg ) && (B_pos[ii] > B_m_pos[ii])) << 2 );
-    for(ssize_t j=i; j >= 0; --j){
-      jj = B_i.a[j];
-      if( B_pos[ii] - B_pos[jj] >= min_sep )
-	B_int[j] += 1 / (double)(B_pos[ii] - B_pos[jj]);
-	  //      if( B_m_tg[jj] == B_tg && B_m_pos[jj] >= B_min )
-	  //	B_int[j] += 1 / (double)(abs(B_pos[ii] - B_m_pos[jj]));
+  for(ssize_t i=(B_pairs.n-1); i >=0; --i){
+    B_obs_pos[i] = B_pairs.a[i].pos;
+    B_obs_mpos[i] = B_pairs.a[i].m_pos;
+    B_obs_flag[i] = B_pairs.a[i].m_pos >= B_off | ((B_pairs.a[i].m_pos < B_off) << 1) |
+      ((B_pairs.a[i].pos > B_pairs.a[i].m_pos) << 2);
+    for(ssize_t j=i-1; j >= 0; --j){
+      if( B_pairs.a[i].pos - B_pairs.a[j].pos >= min_sep )
+	B_int[i] += 1 / (double)(B_pairs.a[i].pos - B_pairs.a[j].pos);
     }
-    for(size_t j=0; j < A_i.n; ++j){
-      for(size_t k=0; k < seps_n; ++k)
-	B_to_A[j * seps_n + k] += 1 / (double)( (B_pos[B_i.a[i]] - B_min) + (A_max - A_pos[A_i.a[j]]) + seps[k] );
+    for(size_t j=0; j < A_pairs.n; ++j){
+      for(size_t k=0; k < seps_n; ++k){
+	if(seps[k] + B_pairs.a[i].pos - A_pairs.a[j].pos > min_sep)
+	  B_to_A[j * seps_n + k] += 1 / (double)( seps[k] + B_pairs.a[i].pos - A_pairs.a[j].pos );
+      }
     }
   }
-  kv_destroy(A_i);
-  kv_destroy(B_i);
+  kv_destroy(A_pairs);
+  kv_destroy(B_pairs);
   UNPROTECT(3);
   return(ret_data);
 }
